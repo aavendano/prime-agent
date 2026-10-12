@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "prime-agent",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "export PATH=\"$HOME/.cargo/bin:$PATH\" && cargo run -p pa-cli --bin prime-agent",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

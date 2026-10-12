@@ -1,0 +1,6 @@
+{
+  "rust-analyzer.linkedProjects": ["${workspaceFolder}/Cargo.toml"],
+  "terminal.integrated.env.linux": {
+    "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+  }
+}
