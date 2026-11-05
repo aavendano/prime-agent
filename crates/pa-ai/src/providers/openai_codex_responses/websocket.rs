@@ -43,6 +43,10 @@ pub(crate) enum WorkerCommand {
     Send {
         body: String,
         events: mpsc::Sender<WorkerEvent>,
+        /// This request's own abort signal. A reused connection outlives the request that opened
+        /// it, so the worker races each read against the current request's token, never the
+        /// opener's (which fires when that first request's stream is dropped).
+        signal: Option<CancellationToken>,
     },
     Close,
 }
@@ -199,7 +203,12 @@ async fn spawn_connection_worker(
         return Err(CodexStreamError::Aborted);
     }
 
-    let connect = tokio_tungstenite::connect_async(request);
+    let connect = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        None,
+        false,
+        Some(crate::utils_inner::tls::websocket_connector()),
+    );
     let (stream, _response) = match signal.as_ref() {
         Some(signal) => {
             tokio::select! {
@@ -213,16 +222,12 @@ async fn spawn_connection_worker(
 
     let connection_id = next_connection_id();
     let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>(4);
-    tokio::spawn(connection_worker(stream, command_rx, signal));
+    tokio::spawn(connection_worker(stream, command_rx));
     Ok((command_tx, connection_id))
 }
 
 /// The worker parks between requests so a session can reuse one connection.
-async fn connection_worker(
-    stream: WsStream,
-    mut commands: mpsc::Receiver<WorkerCommand>,
-    signal: Option<CancellationToken>,
-) {
+async fn connection_worker(stream: WsStream, mut commands: mpsc::Receiver<WorkerCommand>) {
     let (mut sink, mut stream) = stream.split();
     loop {
         let Some(command) = commands.recv().await else {
@@ -233,7 +238,11 @@ async fn connection_worker(
                 let _ = sink.close().await;
                 return;
             }
-            WorkerCommand::Send { body, events } => {
+            WorkerCommand::Send {
+                body,
+                events,
+                signal,
+            } => {
                 if sink.send(Message::Text(body.into())).await.is_err() {
                     // A dead socket surfaces through its close event (the TS runtime's send on a
                     // closed socket is a silent no-op; the close event carries the failure).
@@ -393,6 +402,7 @@ impl AcquiredConnection {
             .send(WorkerCommand::Send {
                 body: request.to_string(),
                 events: event_tx,
+                signal,
             })
             .await
             .map_err(|_| {

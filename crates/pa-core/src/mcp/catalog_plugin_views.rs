@@ -848,6 +848,10 @@ mod connection_view_tests {
                 disabled_tools: None,
                 startup_timeout_ms: None,
                 call_timeout_ms: None,
+                client_id: None,
+                callback_port: None,
+                client_secret: None,
+                scopes: None,
             },
         );
         let credentials = credentials_with(&[

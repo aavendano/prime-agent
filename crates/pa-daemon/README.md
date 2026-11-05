@@ -30,21 +30,13 @@ command gating on peer links), kernel agent_message/agent_observe bridge (`agent
 `worker`-purpose single-use grants minted by `get_worker_peer_transport`
 for a source worker's kernel `agent_message.send`, direct
 `worker_deliver_message` on the target worker's socket with the supervisor
-routed `send_message` as the never-retried fallback), session archiving
-(`session_archive.rs`: the sessions directory must not grow forever — a
-supervisor boot sweep plus a periodic re-sweep at the TS idle-eviction
-cadence retire sessions by age (settings `sessionArchiveMaxAgeDays`,
-default 30) and count (settings `sessionArchiveMaxSessions`, default 200;
-each rule independently off-able) by MOVING them into
-`<agent-dir>/sessions-archive`; resident-worker sessions and sessions with
-active scheduled jobs are never archived; an archived session stays
-resumable — the catalog resolve falls back to the archive, restores the
-file into the sessions dir, and the wake spawns over the live path),
+routed `send_message` as the never-retried fallback),
 saved-session wake
 for non-resident `send_message` targets (`session_catalog.rs`: catalog
-resolve by session-id prefix or exact name, cwd-scoped first, archived
-fallback with restore; a resident
-worker hosting the file is reused, otherwise one spawns over it; RLM
+resolve by session-id prefix or exact name, cwd-scoped first; a live miss
+lazily restores a matching file from `sessions-archive/` without
+overwriting an existing live file; no new sessions are physically archived;
+a resident worker hosting the file is reused, otherwise one spawns over it; RLM
 children fall back to the spawn ledger's live child edges when the catalog
 misses - children persist outside the sessions dir, under the parent's
 session-artifacts tree - and wake over their own session file), wire protocol serve/negotiation (including the
@@ -84,10 +76,7 @@ merge non-resident ledger children (walk roots = saved + resident session
 files), so passivated children stay roster-visible (TS
 `walkPassiveRlmSubagents` / `withPassiveRlmDescendantInfos`). The saved
 session scan (`session_store.rs`) folds each file once into the durable
-catalog row, including the agents-view search corpus the TS scan builds:
-the capped `allMessagesText` transcript text (64 KiB). Archived sessions live in
-`<agent-dir>/sessions-archive` and never reach the catalog scan, so search
-covers live sessions only.
+catalog row.
 Supervisor-backed RLM child sessions
 (`rlm_children.rs`, the daemon side of the pa-core `RlmSubagentHost` seam):
 `rlm.spawn`/`rlm.create_session` create real daemon sessions through the
@@ -257,28 +246,12 @@ attached UIs daemon-wide).
 ## Non-goals
 No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 
-The Decision API child (`rlm.spawn(kind="decision")`) runs the decision
-engine: one spawned session whose every message is one decision request —
-served by the `decisionApi.systemOneModel` model through the ordinary
-provider transports (the shared pa-core decision path), with the parent's
-tagged goal messages routed into its goal input (the newest seq wins) and
-each answer returned to the parent as a tagged `decision_api.decision`
-message the loop awaits. The spawn resolves the child's model through the
-registry and refuses with the setting's actionable message while it is
-unset or unresolvable.
-
 ## Public API
 Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_worker_mcp_login}` (the worker's browser+callback login behind `mcp.begin_login`; wired by the agent engine before sessions register host handlers), client connection API for pa-tui/pa-cli, `acp::daemon::{run_daemon_attached_acp_mode, DaemonAcpOptions}` (pa-cli dispatches `--mode acp` through it), `agent_messaging::LinkAgentMessageController` + `rlm_children::{SupervisorChildSessions, ParentIdentity, RlmChildIdentity}` (e2e verifiers construct the worker-side family controller and the children registry; the engine wires the same types), `agent_engine::AgentSessionEngine::dispose_kernel` (the session-end kernel teardown the worker invokes at kill/shutdown/orphan exit — the engine outlives the session, so the pa-core engine-drop teardown cannot run there), the worker's `get_mcp_connections` command (`mcp_connections.rs`: the `/mcp` view's roster from the session's MCP manager overlaid with the session kernel's per-server tool listing, plus the api-key credential rows the same response serves — Rust-native session-plane extension; the TS daemon has no counterpart). Supervision internals `pub(crate)`.
 
 
 ## Depends on
 pa-types, pa-core (one-way).
-
-Attach snapshots derive the Decision API state from the selected session-store
-branch, including the window's pre-compaction metadata. This private store getter
-runs before the lazy session engine builds and never resolves auth, models, or the
-kernel. Branch replacement changes the next snapshot immediately; explicit off
-and malformed status rows clear earlier state.
 
 The composition root initializes the packaged product version with
 `protocol::configure_app_version` before entering daemon or worker mode.

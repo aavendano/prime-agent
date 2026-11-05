@@ -1,14 +1,16 @@
 //! The engine's lifecycle surface: the constructor and the session
 //! build/adopt/retire cycle, the closed-state markers, the skill
 //! expansion and session-command funnels, and the kernel host wiring.
+use std::sync::atomic::Ordering;
+
 use super::{
     execute_session_command, json_round_trip, map_thinking_level,
     register_agent_message_host_handlers, register_agent_observe_host_handlers,
     switchable_stream_fn, AgentEngineConfig, AgentSessionEngine, Arc, CoreSessionEngine,
     EngineModelSelection, HostRequestHandlers, LinkAgentMessageController,
-    LinkAgentObserveController, Model, OverflowRecovery, ProducerUsageSink, ProviderTarget,
-    QuotaParkState, SessionCommandExecution, SessionCommandParams, SessionEngineConfig,
-    SupervisorChildSessions, Value,
+    LinkAgentObserveController, Model, OverflowRecovery, ProducerUsageSink, PromptContextBoundary,
+    ProviderTarget, QuotaParkState, SessionCommandExecution, SessionCommandParams,
+    SessionEngineConfig, SupervisorChildSessions, Value,
 };
 
 /// The instruction the floor appends to a bare skill invocation: ask what
@@ -54,6 +56,7 @@ impl AgentSessionEngine {
                 config.agent_dir.clone(),
                 link_config.active_session_id.clone(),
                 std::sync::Arc::clone(&model_refusal_telemetry),
+                link_config.worker_token.clone(),
             ))
         });
         let autonomous_driver = std::sync::RwLock::new(std::sync::Arc::new(
@@ -63,40 +66,39 @@ impl AgentSessionEngine {
         let cwd = std::sync::Arc::new(std::sync::RwLock::new(config.cwd.clone()));
         // The ACP MCP store (auth storage construction is blocking, off the hot async paths).
         let agent_dir = config.agent_dir.clone();
-        // Settings-declared user servers; re-read per resolve so `mcp.refresh` sees settings
-        // changes.
+        // Executable MCP settings and catalog sources are user/global only.
+        // Re-read per resolve so refresh sees user changes without project overrides.
         let mcp_cwd = std::sync::Arc::clone(&cwd);
         let mcp_agent_dir = agent_dir.clone();
         let catalog_cwd = std::sync::Arc::clone(&cwd);
         let catalog_agent_dir = agent_dir.clone();
+        let user_servers: pa_core::mcp::UserServersFn = std::sync::Arc::new(move || {
+            // The live cwd slot, not the construction-time cwd: the rebind must reach the MCP
+            // settings discovery.
+            let mcp_cwd = mcp_cwd.read().expect("engine cwd lock").clone();
+            let settings = pa_core::settings::SettingsManager::create(&mcp_cwd, &mcp_agent_dir);
+            Some(
+                settings
+                    .global_settings()
+                    .mcp_servers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(server, server_config)| {
+                        serde_json::from_value(server_config)
+                            .ok()
+                            .map(|parsed| (server, parsed))
+                    })
+                    .collect::<std::collections::HashMap<String, pa_core::mcp::McpServerConfig>>(),
+            )
+        });
+        let oauth_user_servers = std::sync::Arc::clone(&user_servers);
         let mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: pa_core::auth::AuthStorage::create_with_oauth(
                 &agent_dir,
-                std::sync::Arc::new(pa_core::mcp::McpOAuth::new()),
+                std::sync::Arc::new(pa_core::mcp::McpOAuth::new(oauth_user_servers)),
             ),
-            get_user_servers: Box::new(move || {
-                // The live cwd slot, not the construction-time cwd: the rebind must reach the MCP
-                // settings discovery.
-                let mcp_cwd = mcp_cwd.read().expect("engine cwd lock").clone();
-                let settings = pa_core::settings::SettingsManager::create(&mcp_cwd, &mcp_agent_dir);
-                Some(
-                    settings
-                        .settings()
-                        .mcp_servers
-                        .clone()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|(server, server_config)| {
-                            serde_json::from_value(server_config)
-                                .ok()
-                                .map(|parsed| (server, parsed))
-                        })
-                        .collect::<std::collections::HashMap<
-                            String,
-                            pa_core::mcp::McpServerConfig,
-                        >>(),
-                )
-            }),
+            get_user_servers: Box::new(move || user_servers()),
             begin_login: None,
             agent_dir: Some(agent_dir),
             get_catalog_sources: Some(Box::new(move || {
@@ -105,7 +107,7 @@ impl AgentSessionEngine {
                 let settings =
                     pa_core::settings::SettingsManager::create(&catalog_cwd, &catalog_agent_dir);
                 settings
-                    .settings()
+                    .global_settings()
                     .mcp_catalog_sources
                     .clone()
                     .unwrap_or_default()
@@ -125,7 +127,6 @@ impl AgentSessionEngine {
         // unseeded (None keeps the TS default "one-at-a-time").
         let queue_modes = std::sync::Mutex::new((None, None));
         Ok(Self {
-            decision_replies: Arc::default(),
             runtime,
             config,
             mcp,
@@ -136,7 +137,7 @@ impl AgentSessionEngine {
             goal_budget_crossed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             goal_input_probe: std::sync::Mutex::new(None),
             goal_admission_sink: std::sync::Mutex::new(None),
-            bash_completion_sink: std::sync::Mutex::new(None),
+            kernel_notice_sink: std::sync::Mutex::new(None),
             bash_consumed_sink: std::sync::Mutex::new(None),
             goal_queue_purge: std::sync::Mutex::new(None),
             goal_backoff_wake_job_id: std::sync::Mutex::new(None),
@@ -154,11 +155,17 @@ impl AgentSessionEngine {
             initial_selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
             service_tier: std::sync::RwLock::new(None),
-            session: tokio::sync::Mutex::new(None),
+            session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            threshold_yielded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            threshold_checks_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             session_build: tokio::sync::Mutex::new(()),
             pending_branch: std::sync::Mutex::new(None),
+            prompt_context_boundary: std::sync::Mutex::new(None),
             provider_target: std::sync::Arc::new(std::sync::RwLock::new(None)),
             image_route: std::sync::Mutex::new(None),
+            reload_lock: std::sync::Mutex::new(()),
             own_summary: std::sync::Arc::new(std::sync::Mutex::new(None)),
             create_resources: std::sync::RwLock::default(),
             autonomous: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -167,6 +174,7 @@ impl AgentSessionEngine {
             link,
             children,
             usage_producer: std::sync::Mutex::new(None),
+            rlm_usage_store: std::sync::Mutex::new(None),
             quota_park: std::sync::Arc::new(std::sync::Mutex::new(None)),
             quota_parked_this_run: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             autonomous_driver,
@@ -179,6 +187,7 @@ impl AgentSessionEngine {
             autonomous_queue_purge: std::sync::Mutex::new(None),
             cwd,
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
+            factory_child: std::sync::atomic::AtomicBool::new(false),
             rlm_max_depth_source: std::sync::Mutex::new("default"),
             pending_max_depth: std::sync::Mutex::new(None),
             reloaded_goal_update: std::sync::Mutex::new(None),
@@ -186,6 +195,8 @@ impl AgentSessionEngine {
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
             auto_compaction_abort: std::sync::Mutex::new(None),
             compaction_summary_sink: std::sync::Mutex::new(None),
+            progress_notes: std::sync::Mutex::new(None),
+            progress_note_emit: std::sync::Mutex::new(None),
             model_refusal_telemetry,
             semantic_identity: std::sync::Mutex::new(None),
         })
@@ -251,9 +262,9 @@ impl AgentSessionEngine {
                 return Ok(());
             }
         }
-        let built = self.build_session(model).await?;
+        let built = Arc::new(self.build_session(model).await?);
         self.adopt_built_session(&built).await?;
-        self.session.lock().await.replace(Arc::new(built));
+        self.session.lock().await.replace(built);
         Ok(())
     }
 
@@ -270,6 +281,29 @@ impl AgentSessionEngine {
             .compaction_summary_sink
             .lock()
             .expect("compaction summary sink lock") = Some(sink);
+    }
+
+    pub(crate) fn set_rlm_usage_store(
+        &self,
+        store: std::sync::Arc<dyn pa_core::session_engine::rlm_usage::RlmChildUsageStore>,
+    ) {
+        *self.rlm_usage_store.lock().expect("rlm usage store lock") = Some(store);
+    }
+
+    /// Installs the worker's accepted-note announcer, threaded into every
+    /// session build.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the announcer slot's mutex is poisoned.
+    pub fn set_progress_note_emit(
+        &self,
+        emit: pa_core::session_engine::rlm_host::RlmProgressNoteEmit,
+    ) {
+        *self
+            .progress_note_emit
+            .lock()
+            .expect("progress note emit lock") = Some(emit);
     }
 
     /// The stale-row guard's deferred durable write: the terminal row
@@ -305,8 +339,13 @@ impl AgentSessionEngine {
         }
     }
 
-    async fn adopt_built_session(&self, built: &CoreSessionEngine) -> anyhow::Result<()> {
+    async fn adopt_built_session(&self, built: &Arc<CoreSessionEngine>) -> anyhow::Result<()> {
         self.mirror_goal_runtime(built).await;
+        *self
+            .progress_notes
+            .lock()
+            .expect("progress notes mirror lock") =
+            Some(std::sync::Arc::clone(&built.rlm_progress_notes));
         if let Some(sink) = self
             .compaction_summary_sink
             .lock()
@@ -324,7 +363,7 @@ impl AgentSessionEngine {
             Some(crate::autonomous_continuation::AutonomousBoundaryMirror {
                 turn_boundary: std::sync::Arc::clone(&built.turn_boundary),
                 agent: std::sync::Arc::clone(built.session.agent()),
-                compaction: built.session.compaction_settings(),
+                session: Arc::downgrade(built),
             });
         // The background-bash liveness probe: a deadlock-free read over the
         // build's provisioner.
@@ -437,6 +476,92 @@ impl AgentSessionEngine {
                 shared_branch = branch;
             }
         }
+        // The worker persisted accepted rows while this lazy session built.
+        // Keep its whole durable window, but seed the loop only through the
+        // stable pre-admission leaf. Content/timestamps are never deduplicated.
+        let prompt_context_boundary = self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock")
+            .clone();
+        let entries = pending_branch
+            .as_deref()
+            .or_else(|| {
+                shared_window
+                    .as_ref()
+                    .map(pa_core::session::window::WindowedSessionStore::entries)
+            })
+            .or(shared_branch.as_deref());
+        let mut admitted_user_ids = Vec::new();
+        if std::env::var_os("PA_COMPACTION_TRACE").is_some() {
+            pa_core::session_engine::compaction_trace::trace(
+                "daemon.lazy_restore_boundary",
+                &serde_json::json!({
+                    "kind": match &prompt_context_boundary {
+                        Some(PromptContextBoundary::Empty) => "empty",
+                        Some(PromptContextBoundary::Leaf(_)) => "leaf",
+                        None => "unset",
+                    },
+                    "retainedUserRows": entries.map_or(0, |entries| entries.iter().filter(|entry|
+                        matches!(entry, pa_types::session::FileEntry::Message {
+                            message: pa_types::session::AgentMessage::User(_), ..
+                        })).count()),
+                }),
+            );
+        }
+        let prompt_context = match prompt_context_boundary.as_ref() {
+            Some(boundary) => {
+                let mut after_boundary = matches!(boundary, PromptContextBoundary::Empty);
+                if let Some(entries) = entries {
+                    for entry in entries {
+                        if after_boundary {
+                            if let Some(id) = entry.id().filter(|_| {
+                                matches!(
+                                    entry,
+                                    pa_types::session::FileEntry::Message {
+                                        message: pa_types::session::AgentMessage::User(_),
+                                        ..
+                                    }
+                                )
+                            }) {
+                                admitted_user_ids.push(id.to_string());
+                            }
+                        } else if matches!(boundary, PromptContextBoundary::Leaf(leaf)
+                            if entry.id() == Some(leaf.as_str()))
+                        {
+                            after_boundary = true;
+                        }
+                    }
+                }
+                match boundary {
+                    PromptContextBoundary::Leaf(leaf) => {
+                        anyhow::ensure!(
+                            after_boundary,
+                            "prompt context boundary {leaf} is absent from the retained transcript"
+                        );
+                        Some(
+                            pa_core::session::build_session_context(
+                                entries.expect("a found boundary has entries"),
+                                Some(leaf),
+                            )
+                            .messages,
+                        )
+                    }
+                    PromptContextBoundary::Empty => Some(Vec::new()),
+                }
+            }
+            None => None,
+        };
+        if std::env::var_os("PA_COMPACTION_TRACE").is_some() {
+            pa_core::session_engine::compaction_trace::trace(
+                "daemon.lazy_restore_context",
+                &serde_json::json!({
+                    "priorUserRows": prompt_context.as_ref().map(|messages| messages.iter().filter(|message|
+                        matches!(message, pa_types::session::AgentMessage::User(_))).count()),
+                    "replayedUserRows": admitted_user_ids.len(),
+                }),
+            );
+        }
         if let Some(state) = seed {
             // The restore-resurrection guard: an active seed whose
             // trailing turn settled as a terminal provider failure adopts
@@ -494,13 +619,24 @@ impl AgentSessionEngine {
         }
         if let Some(entries) = pending_branch {
             built.session.rebuild_branch_context(entries).await?;
-            // The Decision API follows the adopted context: the provider
-            // row the restored branch carries becomes the session's switch
-            // before the engine is installed and any turn runs.
+            built
+                .session
+                .shared_persistence()
+                .lock()
+                .await
+                .replay_admitted_user_rows(admitted_user_ids)?;
+            if let Some(messages) = prompt_context {
+                built
+                    .session
+                    .agent()
+                    .set_messages(messages.iter().filter_map(json_round_trip).collect())
+                    .await;
+            }
             // A moved branch restores its own park (the early return would leave the previous
             // branch's park armed).
             self.restore_quota_park(built).await;
             self.flush_pending_stale_goal_terminal().await;
+            self.finish_prompt_context_adoption(prompt_context_boundary.as_ref());
             return Ok(());
         }
         // Restore the retained context and certified metadata without loading discarded bodies.
@@ -520,11 +656,37 @@ impl AgentSessionEngine {
             built.session.rebuild_branch_context(entries).await?;
             self.flush_pending_stale_goal_terminal().await;
         }
+        built
+            .session
+            .shared_persistence()
+            .lock()
+            .await
+            .replay_admitted_user_rows(admitted_user_ids)?;
+        if let Some(messages) = prompt_context {
+            built
+                .session
+                .agent()
+                .set_messages(messages.iter().filter_map(json_round_trip).collect())
+                .await;
+        }
         self.restore_quota_park(built).await;
         // The walk and replay allocated transient trees several times the
         // retained size: release the freed heap.
         pa_types::memory_release::trim_freed_heap();
+        self.finish_prompt_context_adoption(prompt_context_boundary.as_ref());
         Ok(())
+    }
+
+    /// Clear only the boundary this completed adoption observed. A failed
+    /// build keeps it for the demand retry, and a newer captured leaf survives.
+    fn finish_prompt_context_adoption(&self, adopted: Option<&PromptContextBoundary>) {
+        let mut current = self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock");
+        if current.as_ref() == adopted {
+            *current = None;
+        }
     }
 
     /// Scan the branch entries for the park this branch ended on and re-arm the live park state.
@@ -594,10 +756,15 @@ impl AgentSessionEngine {
         let _build = self.session_build.lock().await;
         let built = self.session.lock().await.take();
         *self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock") = None;
+        *self
             .quota_park
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         *self.goal_runtime.lock().expect("goal runtime lock") = None;
+        *self.progress_notes.lock().expect("progress notes lock") = None;
         *self.turn_agent.lock().expect("turn agent lock") = None;
         *self
             .autonomous_boundary
@@ -732,6 +899,7 @@ impl AgentSessionEngine {
     pub(crate) fn execute_session_command(
         &self,
         command: &pa_core::session_engine::slash_commands::SessionSlashCommand,
+        images: &[pa_agent::types::ImageContent],
     ) -> anyhow::Result<SessionCommandExecution> {
         let model = self.session_model()?;
         self.ensure_core_session(&model)?;
@@ -752,7 +920,7 @@ impl AgentSessionEngine {
             .expect("session built by ensure_core_session");
         Ok(self
             .runtime
-            .block_on(async { execute_session_command(&core, &mut params, command).await }))
+            .block_on(async { execute_session_command(&core, &mut params, command, images).await }))
     }
 
     /// The current explicit selection (create-config flags over the
@@ -780,34 +948,9 @@ impl AgentSessionEngine {
             self.children.clone(),
         ));
         let mut handlers = HostRequestHandlers::default();
-        let replies = Arc::clone(&self.decision_replies);
-        handlers.register(
-            "decision_api.decision",
-            pa_core::kernel::shared::host_handler(move |payload| {
-                let replies = Arc::clone(&replies);
-                Box::pin(async move {
-                    let name = payload.data["name"].as_str().ok_or_else(|| {
-                        anyhow::anyhow!("decision_api.decision requires a child name")
-                    })?;
-                    let mut replies = replies
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if payload.data["close"] == true {
-                        replies.remove(name);
-                        Ok(Value::Null)
-                    } else {
-                        Ok(replies
-                            .entry(name.to_string())
-                            .or_default()
-                            .take()
-                            .unwrap_or(Value::Null))
-                    }
-                })
-            }),
-        );
         register_agent_message_host_handlers(sender, &mut handlers);
         register_agent_observe_host_handlers(observer, &mut handlers);
-        self.register_bash_notice_host_handlers(&mut handlers);
+        self.register_kernel_notice_host_handlers(&mut handlers);
         Some(handlers)
     }
 
@@ -843,7 +986,7 @@ impl AgentSessionEngine {
         })
     }
 
-    pub(super) async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
+    async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
         // The live queue-delivery modes: read under a scoped lock (a std
@@ -866,6 +1009,30 @@ impl AgentSessionEngine {
         // rebuild.
         let stream_fn = switchable_stream_fn(std::sync::Arc::clone(&self.provider_target));
         {
+            // The build's resolve-and-install serializes with `/reload`'s
+            // live-input refresh (the other slot writers' fence): a reload
+            // landing between this resolution and the slot write must not
+            // be clobbered by the build's older pair. The lock is
+            // acquired by yielding, never by blocking this worker: a
+            // reload holds the lock across auth-file I/O and a possible
+            // OAuth refresh, so a blocking acquire on an async path
+            // would stall the executor for that span.
+            let _reload_serialized = loop {
+                match self.reload_lock.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::WouldBlock) => {}
+                    // The poisoned error CARRIES the acquired guard (the
+                    // panicking holder is gone, the lock is free): recover
+                    // it — a fresh .lock() here would wait on the guard
+                    // this match's scrutinee still holds.
+                    Err(std::sync::TryLockError::Poisoned(poison)) => break poison.into_inner(),
+                }
+                // Park, never hot-spin: a reload holds the lock across
+                // auth-file I/O and a possible OAuth refresh, and
+                // yield_now would leave this task immediately runnable
+                // through all of it.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
             let (api_key, headers) = self.resolve_request_key_and_headers(model);
             let mut target = self.provider_target.write().expect("provider target lock");
             *target = Some(ProviderTarget {
@@ -887,7 +1054,7 @@ impl AgentSessionEngine {
         // The engine session stays non-persisted (the worker owns the
         // durable file); the configured session dir leads, the file's
         // parent is the fallback.
-        let session_manager = match self
+        let mut session_manager = match self
             .config
             .session_dir
             .as_deref()
@@ -901,7 +1068,19 @@ impl AgentSessionEngine {
             }
             None => pa_core::session::manager::SessionManager::in_memory(&cwd),
         };
-
+        // The in-memory manager takes the durable file's header id, as TS's engine opened the
+        // durable file: provider requests key prompt caching, Codex socket reuse, and session
+        // headers on it, so it must survive a resume in a new worker, a replacement build, and
+        // a daemon restart. A pathless session keeps the manager's own id.
+        if let Some(header) = session_file
+            .as_deref()
+            .and_then(pa_core::session::manager::read_session_header)
+        {
+            session_manager.new_session(&pa_core::session::manager::NewSessionOptions {
+                id: Some(header.id),
+                ..Default::default()
+            });
+        }
         if let Some(children) = &self.children {
             children.set_model(format!("{}/{}", model.provider, model.id));
         }
@@ -932,6 +1111,16 @@ impl AgentSessionEngine {
             .goal_queue_purge
             .lock()
             .expect("goal queue purge lock")
+            .clone();
+        let rlm_usage_store = self
+            .rlm_usage_store
+            .lock()
+            .expect("rlm usage store lock")
+            .clone();
+        let progress_note_emit = self
+            .progress_note_emit
+            .lock()
+            .expect("progress note emit lock")
             .clone();
         // The kernel's last live background `bash()` handle settling
         // (or a mid-run teardown) retries the owed continuations. No
@@ -990,15 +1179,81 @@ impl AgentSessionEngine {
             rlm_subagent_host: self.children.clone().map(|children| {
                 children as Arc<dyn pa_core::session_engine::rlm_host::RlmSubagentHost>
             }),
+            rlm_usage_store,
+            progress_note_emit,
             rlm_depth: Some(self.rlm_depth.load(std::sync::atomic::Ordering::Relaxed)),
+            factory_child: self
+                .factory_child
+                .load(std::sync::atomic::Ordering::Relaxed),
+            // The worker session runs under the daemon scheduler and its wake-ups.
+            daemonless: false,
             model_info: Some(model.clone()),
             // Prewarm; the depth gate keeps subagent workers lazy.
             prewarm_ipython_kernel: Some(true),
             on_background_work_settled,
+            bash_notice_wake: None,
             // The worker-installed purge withdraws queued minted continuations.
             queued_goal_context_purge,
             // The steering lane owns the stop hooks (a queued steer cuts the next turn).
             queued_steering_probe: self.config.queued_steering_probe.clone(),
+            should_stop_after_turn: Some({
+                let session = Arc::downgrade(&self.session);
+                let target = Arc::clone(&self.provider_target);
+                let yielded = Arc::clone(&self.threshold_yielded);
+                let enabled = Arc::clone(&self.threshold_checks_enabled);
+                Arc::new(move |context| {
+                    let session = session.clone();
+                    let target = Arc::clone(&target);
+                    let yielded = Arc::clone(&yielded);
+                    let enabled = Arc::clone(&enabled);
+                    Box::pin(async move {
+                        if context.tool_results.is_empty() || !enabled.load(Ordering::SeqCst) {
+                            return Ok(false);
+                        }
+                        let Some(session) = session.upgrade() else {
+                            return Ok(false);
+                        };
+                        let engine = session.lock().await.clone();
+                        let Some(engine) = engine else {
+                            return Ok(false);
+                        };
+                        // Capture the actual serving model before AgentEnd clears a routed override.
+                        let model = target
+                            .read()
+                            .expect("provider target lock")
+                            .as_ref()
+                            .map(|target| target.model.clone());
+                        let Some(model) = model else { return Ok(false) };
+                        let agent = engine.session.agent();
+                        let thinking = match agent.model_override() {
+                            Some(route) => route.thinking_level,
+                            None => agent.state().await.thinking_level,
+                        };
+                        let messages = context
+                            .context
+                            .messages
+                            .iter()
+                            .filter_map(|message| serde_json::to_value(message).ok())
+                            .filter_map(|value| serde_json::from_value(value).ok())
+                            .collect::<Vec<_>>();
+                        let due = pa_core::session_engine::compaction::threshold_compaction_due(
+                            &messages,
+                            model.context_window,
+                            pa_core::session_engine::compaction::request_output_budget(
+                                &model,
+                                pa_core::session_engine::provider_adapter::model_thinking_level(
+                                    thinking,
+                                ),
+                            ),
+                            &engine.session.compaction_settings(),
+                        );
+                        if due {
+                            yielded.store(true, Ordering::SeqCst);
+                        }
+                        Ok(due)
+                    })
+                })
+            }),
             // Seeded from settings at create; the live switch updates the slot ahead of any later
             // build.
             steering_mode,
@@ -1028,92 +1283,5 @@ impl AgentSessionEngine {
                 engine.session.agent().set_follow_up_mode(mode);
             }
         })
-    }
-}
-
-#[cfg(test)]
-mod decision_reply_tests {
-    use super::*;
-    use crate::worker::{Worker, WorkerConfig};
-    use pa_core::kernel::shared::HostRequestPayload;
-    use serde_json::json;
-
-    #[tokio::test]
-    async fn child_decision_replies_reach_the_loop_without_queuing_a_parent_turn() {
-        let dir = tempfile::tempdir().unwrap();
-        let worker = Worker::new(
-            WorkerConfig {
-                socket_path: dir.path().join("worker.sock"),
-                supervisor_socket_path: dir.path().join("supervisor.sock"),
-                token: "token".into(),
-                worker_instance_id: String::new(),
-                active_session_id: "parent".into(),
-                agent_dir: dir.path().join("agent"),
-                recovery_journal_path: dir.path().join("recovery.jsonl"),
-                telemetry_disabled: Some(true),
-                script: None,
-                decision_child: false,
-            },
-            /*registration*/ None,
-        );
-        let created = worker
-            .dispatch("create", &json!({"noSession":true,"cwd":dir.path()}))
-            .await;
-        assert!(created.success);
-        let handlers = worker
-            .agent_engine
-            .as_ref()
-            .unwrap()
-            .extra_host_handlers()
-            .unwrap();
-        let poll = handlers
-            .get("decision_api.decision")
-            .expect("decision route registered");
-        let call = |data| {
-            poll(HostRequestPayload {
-                data,
-                cell_source_code: None,
-            })
-        };
-        assert_eq!(
-            call(json!({"name":"system-1-test"})).await.unwrap(),
-            Value::Null
-        );
-        let decision = json!({
-            "type":"decision_api.decision","seq":0,
-            "decision":{"action":"left","confidence":0.9}
-        });
-        let mut delivery = json!({"message":decision.to_string(),"sender":{
-            "activeSessionId":"child","sessionName":"system-1-test",
-            "parentActiveSessionId":"parent","runtimeKind":"subagent"
-        }});
-        worker.core.lock().unwrap().busy = true;
-        assert!(worker.handle_worker_deliver_message(&delivery).success);
-        assert_eq!(
-            call(json!({"name":"system-1-test"})).await.unwrap(),
-            decision
-        );
-        assert_eq!(
-            call(json!({"name":"system-1-test"})).await.unwrap(),
-            Value::Null
-        );
-        assert!(worker.core.lock().unwrap().steering.is_empty());
-        assert!(worker.core.lock().unwrap().follow_up.is_empty());
-        worker.core.lock().unwrap().busy = false;
-        call(json!({"name":"system-1-test","close":true}))
-            .await
-            .unwrap();
-        assert!(worker.handle_worker_deliver_message(&delivery).success);
-        assert!(
-            worker.core.lock().unwrap().steering.is_empty(),
-            "a closed decision child must not wake the parent"
-        );
-        delivery["sender"]["parentActiveSessionId"] = json!("another-parent");
-        assert!(worker.handle_worker_deliver_message(&delivery).success);
-        assert_eq!(
-            worker.core.lock().unwrap().steering.len(),
-            1,
-            "other agents retain normal routing"
-        );
     }
 }

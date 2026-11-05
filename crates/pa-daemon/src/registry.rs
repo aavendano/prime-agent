@@ -95,6 +95,8 @@ pub(crate) struct ResidentWorker {
     pub(crate) worker_id: String,
     pub(crate) descriptor: Mutex<DaemonWorkerDescriptor>,
     pub(crate) descriptor_path: PathBuf,
+    /// Fresh creates seed their family before replying; adopted workers seed on registration.
+    pub(crate) roster_family_seed_owned_by_create: AtomicBool,
     /// The worker's command pump channel, bounded at
     /// [`crate::backpressure::WORKER_INFLIGHT_CAPACITY`]: admission precedes
     /// enqueue, so the queue and in-flight set share one bound.
@@ -140,6 +142,14 @@ pub(crate) struct ResidentWorker {
     pub(crate) compaction: crate::compaction_supervision::CompactionSupervision,
     /// The pending owner-disconnect stop (TS `ownerCleanupTimer`).
     pub(crate) owner_cleanup: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    /// The client-forwarded launch env (TS `ResidentWorker.launchEnv`):
+    /// in memory ONLY — never the descriptor, never the durable create
+    /// command, never the update roster. The spawn merges it under the
+    /// internal identity overrides. A resident worker loses it once its
+    /// create completes (a crash relaunch runs on the daemon's env); an
+    /// owned worker keeps it for the owner-driven recovery relaunch
+    /// until ownership clears (promotion).
+    pub(crate) launch_env: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>>,
 }
 
 /// The last-good heartbeats rows, tagged with the catalog generation they
@@ -169,6 +179,7 @@ impl ResidentWorker {
             worker_id,
             descriptor: Mutex::new(descriptor),
             descriptor_path,
+            roster_family_seed_owned_by_create: AtomicBool::new(false),
             cmd_tx: Mutex::new(None),
             inflight: Arc::new(tokio::sync::Semaphore::new(
                 crate::backpressure::WORKER_INFLIGHT_CAPACITY,
@@ -188,7 +199,22 @@ impl ResidentWorker {
             connection_epoch: AtomicU64::new(0),
             compaction: crate::compaction_supervision::CompactionSupervision::default(),
             owner_cleanup: std::sync::Mutex::new(None),
+            launch_env: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Set the client-forwarded launch env (the in-memory lifetime is
+    /// documented on the field).
+    pub(crate) fn set_launch_env(&self, env: Option<std::collections::BTreeMap<String, String>>) {
+        *self
+            .launch_env
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = env;
+    }
+
+    /// Drop the stored launch env (the ready-time and promotion clears).
+    pub(crate) fn clear_launch_env(&self) {
+        self.set_launch_env(None);
     }
 
     pub(crate) fn route_state(&self) -> WorkerRouteState {

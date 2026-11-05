@@ -9,21 +9,7 @@
 //! fullscreen setting's retirement (the always-fullscreen surface has no
 //! toggle left to advertise).
 #![cfg(unix)]
-// Casts: structurally bounded terminal-layout arithmetic; guarded conversions add panic paths.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
-// Render routes are flat tables (one arm per route); splitting adds indirection.
-#![allow(clippy::too_many_lines)]
-// Widget state structs carry independent flag bits.
-#![allow(clippy::struct_excessive_bools, clippy::fn_params_excessive_bools)]
-// Futures are bounded by the surface's lifetime; boxing adds a steady-state allocation.
-#![allow(clippy::large_futures)]
-// The wrappers preserve a uniform Result-returning API surface.
-#![allow(clippy::unnecessary_wraps)]
+#![warn(clippy::allow_attributes_without_reason)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -55,6 +41,10 @@ impl MockSupervisor {
 
     /// Serve one connection: the connection state carries the session's thinking levels for the
     /// Models tab's submenu rows.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mock daemon request loop: one match arm per scripted request method"
+    )]
     fn serve(self) {
         let (stream, _) = self.listener.accept().expect("accept");
         let write_stream = stream.try_clone().expect("clone mock socket");
@@ -233,6 +223,10 @@ impl Default for RecordingSettings {
 }
 
 impl RecordingSettings {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "returns the ClientSettings setters' Result so each setter can tail-call it"
+    )]
     fn record(&self, entry: &str) -> Result<()> {
         self.writes
             .lock()
@@ -247,6 +241,13 @@ impl RecordingSettings {
 }
 
 impl pa_tui::client_settings::ClientSettings for RecordingSettings {
+    fn compaction_threshold_percent(&self) -> f64 {
+        95.0
+    }
+    fn set_compaction_threshold_percent(&self, percent: f64) -> Result<()> {
+        self.record(&format!("threshold={percent}"))
+    }
+
     fn theme(&self) -> Option<String> {
         None
     }
@@ -730,4 +731,23 @@ fn a_no_match_query_backspaces_away_and_space_still_cycles() {
         row.contains("false"),
         "Space still cycles the selected row: {row}"
     );
+}
+
+#[test]
+fn threshold_percentage_cycles_through_the_persistence_seam() {
+    let mut steps = open_settings();
+    for character in "threshold".chars() {
+        steps.push(HeadlessStep::Key(key(KeyCode::Char(character))));
+    }
+    steps.push(HeadlessStep::Key(key(KeyCode::Right)));
+    steps.push(HeadlessStep::WaitRender {
+        needle: "› Auto-compact threshold (%)".into(),
+        timeout_ms: 5000,
+    });
+    let (frames, settings) = run_plan(steps);
+    assert_eq!(settings.log(), vec!["threshold=100"]);
+    let rows = frame_with(&frames, "› Auto-compact threshold (%)");
+    assert!(rows
+        .iter()
+        .any(|row| row.contains("Auto-compact threshold (%)") && row.contains("100")));
 }

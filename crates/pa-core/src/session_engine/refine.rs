@@ -7,6 +7,7 @@ use pa_types::ai::{UserContent, UserMessage};
 use pa_types::session::{AgentMessage, CustomMessage, FileEntry};
 use serde_json::json;
 
+use super::model_usage::ModelUsage;
 use super::AgentSession;
 use crate::refinement::executor::{
     apply_refinement_plan, plan_refinement, review_auto_refine, AutoRefineReview,
@@ -14,7 +15,8 @@ use crate::refinement::executor::{
 };
 use crate::refinement::{
     append_global_refinement, format_refinement_notice_body, load_global_refinement_history,
-    load_harness_state, merge_harness_states, update_harness_state, HarnessScope, RefinementResult,
+    load_harness_state, merge_harness_states, try_update_harness_state, HarnessScope,
+    RefinementResult,
 };
 use crate::session::manager::SessionManager;
 
@@ -308,6 +310,24 @@ pub async fn execute_refinement_with_rows(
     refine_call: crate::refinement::executor::RefinerFn,
     agent_dir: Option<&Path>,
 ) -> anyhow::Result<(RefinementResult, Vec<String>)> {
+    let settings = match agent_dir {
+        Some(dir) => {
+            let cwd = session.get_cwd().to_path_buf();
+            let dir = dir.to_path_buf();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    let settings = crate::settings::SettingsManager::create(&cwd, &dir);
+                    anyhow::ensure!(
+                        super::refinement_gate::enabled(Some(&settings)),
+                        "Harness refinements are disabled in /settings"
+                    );
+                    Ok::<_, anyhow::Error>(settings)
+                })
+                .await??,
+            )
+        }
+        None => None,
+    };
     let RefinementTranscript {
         messages,
         refinement_history,
@@ -393,14 +413,18 @@ pub async fn execute_refinement_with_rows(
         None => false,
     };
     let (mut result, state_path) = tokio::task::spawn_blocking(move || {
-        update_harness_state(&target_dir, target_scope, |state| {
-            apply_refinement_plan(
+        try_update_harness_state(&target_dir, target_scope, |state| {
+            anyhow::ensure!(
+                super::refinement_gate::enabled(settings.as_ref()),
+                "Harness refinements were disabled during planning; the result was discarded"
+            );
+            Ok(apply_refinement_plan(
                 state,
                 plan,
                 &core_options,
                 Some(baseline_state),
                 factory_enabled,
-            )
+            ))
         })
     })
     .await
@@ -465,6 +489,31 @@ pub(crate) enum AutoRefineRound {
 }
 
 impl AgentSession {
+    /// The refiner model call on the session model, with the merged request
+    /// headers (the Prime team header) the session's own requests send.
+    pub(super) async fn refiner_call(
+        &self,
+        model: &pa_types::ai::Model,
+        api_key: Option<String>,
+    ) -> anyhow::Result<crate::refinement::executor::RefinerFn> {
+        let (api_key, headers) = match self.auxiliary_model.clone() {
+            Some(context) => {
+                let model = model.clone();
+                let routed = tokio::task::spawn_blocking(move || {
+                    super::auxiliary_model::session_fallback_with_headers(&context, &model, api_key)
+                })
+                .await?;
+                (routed.api_key, routed.headers)
+            }
+            None => (api_key, None),
+        };
+        Ok(default_refiner_call(
+            api_key,
+            headers,
+            self.session_id().await,
+        ))
+    }
+
     /// The compact-trigger review: an LLM call over the conversation, the
     /// merged harness state, and the refinement history. `Ok(None)` is the
     /// decline; `Ok(Some(review))` a fresh approval.
@@ -473,6 +522,10 @@ impl AgentSession {
     ///
     /// Returns an error when the conversation history cannot be read or
     /// when the review request fails; a decline is `Ok(None)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the billed-call slot's mutex is poisoned.
     pub async fn review_compact_auto_refine(
         &self,
         model: &pa_types::ai::Model,
@@ -481,6 +534,9 @@ impl AgentSession {
         turns_since_last_review: u32,
         branch_version: u64,
     ) -> anyhow::Result<Option<AutoRefineReview>> {
+        if !self.harness_refinements_enabled() {
+            return Ok(None);
+        }
         // The review reads the same planning inputs the run plans
         // against, extracted under this lock from the retained rows.
         let (parts, merged_state, history) = {
@@ -501,6 +557,8 @@ impl AgentSession {
             refinement_history: session_history,
         } = parts.await?;
         let history = crate::refinement::merge_refinement_history(&history, &session_history);
+        let (review_call, billed) =
+            billed_refiner_call(self.refiner_call(model, api_key).await?, "refine_review");
         let review = review_auto_refine(
             &messages,
             &merged_state,
@@ -510,9 +568,12 @@ impl AgentSession {
                 reason: AUTO_REFINE_COMPACT_REASON.to_string(),
                 turns_since_last_review,
             },
-            default_refiner_call(api_key.clone()),
+            review_call,
         )
-        .await?;
+        .await;
+        let billed = billed.lock().expect("billed refiner call lock").take();
+        self.record_model_usage(billed).await;
+        let review = review?;
         if !review.should_refine {
             return Ok(None);
         }
@@ -584,11 +645,37 @@ impl AgentSession {
     }
 }
 
+/// The refiner seam plus the slot its reply's billed call lands in. The
+/// caller records the call once the refinement released the session lock:
+/// the session-file usage store appends through that same lock.
+pub(crate) fn billed_refiner_call(
+    call: crate::refinement::executor::RefinerFn,
+    source: &'static str,
+) -> (
+    crate::refinement::executor::RefinerFn,
+    std::sync::Arc<std::sync::Mutex<Option<ModelUsage>>>,
+) {
+    let billed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&billed);
+    let seam: crate::refinement::executor::RefinerFn = Box::new(move |model, system, prompt| {
+        let reply = call(model, system, prompt);
+        Box::pin(async move {
+            let reply = reply.await?;
+            *slot.lock().expect("billed refiner call lock") = ModelUsage::of_reply(source, &reply);
+            Ok(reply)
+        })
+    });
+    (seam, billed)
+}
+
 /// The default model seam over pa-ai completion.
 #[must_use]
-pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::executor::RefinerFn {
+pub fn default_refiner_call(
+    api_key: Option<String>,
+    headers: Option<std::collections::BTreeMap<String, String>>,
+    session_id: String,
+) -> crate::refinement::executor::RefinerFn {
     Box::new(move |model, system_prompt, prompt| {
-        let api_key = api_key;
         Box::pin(async move {
             let context = pa_types::ai::Context {
                 system_prompt: Some(system_prompt.to_string()),
@@ -599,11 +686,18 @@ pub fn default_refiner_call(api_key: Option<String>) -> crate::refinement::execu
                 })],
                 tools: None,
             };
-            let stream_options =
+            let mut stream_options =
                 pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
                     api_key,
+                    headers: headers.map(|headers| headers.into_iter().collect()),
+                    session_id: Some(session_id),
+                    // One-off prompts ride SSE: they keep the conversation id (cache key,
+                    // opencode routing) but never take or replace the session's Codex
+                    // WebSocket and its continuation.
+                    transport: Some(pa_ai::types::Transport::Sse),
                     ..Default::default()
                 });
+            stream_options.reasoning = pa_types::ai::minimum_reasoning(&model);
             Ok(pa_ai::complete_simple(&model, &context, Some(stream_options)).await?)
         })
     })
@@ -696,6 +790,48 @@ mod tests {
             timestamp: 0,
             rest: serde_json::Map::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn disabling_refinements_blocks_planning_and_discards_in_flight_results() {
+        let dir = TempDir::new().unwrap();
+        let mut session = persisted_session(&dir);
+        let global_dir = dir.path().join("harness");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let settings = agent_dir.join("settings.json");
+        std::fs::write(&settings, r#"{"harnessRefinements":false}"#).unwrap();
+        let entries_before = session.retained_entries().to_vec();
+        let error = execute_refinement(
+            &mut session,
+            RefinementTranscript {
+                messages: &[],
+                refinement_history: &[],
+            },
+            &global_dir,
+            &test_model(),
+            &RefineOptions::default(),
+            RefinementSource::User,
+            Box::new(|_, _, _| panic!("disabled refinement must not call the planner")),
+            Some(&agent_dir),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("disabled"));
+        std::fs::write(&settings, r#"{"harnessRefinements":true}"#).unwrap();
+        let error = execute_refinement(
+            &mut session, RefinementTranscript { messages: &[user_message("remember this")], refinement_history: &[] },
+            &global_dir, &test_model(), &RefineOptions::default(), RefinementSource::SelfRefine,
+            flip_seam(&settings, r#"{"harnessRefinements":false}"#,
+                r#"{"summary":"memory","edits":[{"action":"create","kind":"memory","id":"note","title":"Note","content":"Remember this"}]}"#),
+            Some(&agent_dir),
+        ).await.unwrap_err();
+        assert!(error.to_string().contains("discarded"));
+        assert_eq!(session.retained_entries(), entries_before.as_slice());
+        assert!(!local_harness_state_dir(&session)
+            .join("harness_state.json")
+            .exists());
+        assert!(!global_dir.exists());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! RLM child model resolution and roster text helpers: reference resolution against the
-//! credential-backed catalog, the spawn-time thinking-support check, plus the roster text caps.
+//! credential-backed catalog, the spawn-time thinking-support check, the requested child cwd,
+//! plus the roster text caps.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use pa_ai::models::{get_supported_thinking_levels, thinking_level_from_str};
@@ -62,7 +63,12 @@ pub fn resolve_child_model(
 
 /// The resolution before the allowlist gate: `None` inherits the parent model; a reference resolves
 /// parent equality first, then an exact catalog selector, then a unique short-form match.
-fn resolve_child_model_unchecked(
+/// Public for the daemonless print host: print sessions do not enforce
+/// `allowedModels`, so its children do not either.
+///
+/// # Errors
+/// Returns an error when the reference cannot be resolved against the catalog.
+pub fn resolve_child_model_unchecked(
     agent_dir: &Path,
     reference: Option<&str>,
     parent_model: Option<&str>,
@@ -151,6 +157,27 @@ pub fn assert_thinking_supported(
     bail!(
         "Requested thinking level \"{level}\" is not supported by model \"{selector}\"; supported levels: {levels}"
     );
+}
+
+/// The directory a child starts in: a requested `cwd` resolves against the
+/// session cwd and is canonicalized (project-context discovery walks its
+/// ancestors), otherwise the child shares the session cwd.
+///
+/// # Errors
+/// Returns an error naming `operation` when the requested directory does not exist.
+pub fn resolve_child_cwd(
+    session_cwd: &Path,
+    requested: Option<&str>,
+    operation: &str,
+) -> Result<PathBuf> {
+    let Some(requested) = requested else {
+        return Ok(session_cwd.to_path_buf());
+    };
+    let joined = session_cwd.join(requested);
+    match joined.canonicalize() {
+        Ok(cwd) if cwd.is_dir() => Ok(cwd),
+        _ => bail!("{operation} cwd {} is not a directory", joined.display()),
+    }
 }
 
 /// Rejection message for an unresolved model reference: the
@@ -442,15 +469,22 @@ mod tests {
             &dir.path().join("models.json"),
             &pa_core::models::PrivatePrimeAuthorizationCache {
                 fingerprint,
-                models: vec![serde_json::from_value(json!({
-                    "id": "internal/glm-5.3-fast", "name": "GLM 5.3 Fast",
-                    "api": "openai-completions", "provider": "prime-inference",
-                    "baseUrl": "https://api.pinference.ai/api/v1",
-                    "reasoning": true, "input": ["text"],
-                    "cost": { "input": 0.42, "output": 2.1, "cacheRead": 0, "cacheWrite": 0 },
-                    "contextWindow": 400_000, "maxTokens": 131_072
-                }))
-                .unwrap()],
+                // The durable wire items (an `/models` payload shape): the
+                // read path parses and builds the model from them.
+                items: vec![json!({
+                    "id": "internal/glm-5.3-fast",
+                    "display_name": "GLM 5.3 Fast",
+                    "pricing": {
+                        "input_usd_per_mtok": 0.42, "output_usd_per_mtok": 2.1,
+                        "cache_read_usd_per_mtok": 0.0, "cache_write_usd_per_mtok": 0.0,
+                    },
+                    "specs": {
+                        "context_window": 400_000, "max_output_tokens": 131_072,
+                        "supports_reasoning": true,
+                        "modalities": { "input": ["text"], "output": ["text"] },
+                    },
+                })],
+                models: Vec::new(),
                 refreshed_at: 1,
             },
         );

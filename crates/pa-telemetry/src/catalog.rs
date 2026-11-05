@@ -761,6 +761,20 @@ const AGENT_COMMAND_USED: EventRule = EventRule {
     properties: &[("command_name", required(free_string(64)))],
 };
 
+/// Adoption of the automatic compaction percentage setting; no session content.
+const AUTOCOMPACT_THRESHOLD_CHANGED: EventRule = EventRule {
+    name: "autocompact threshold changed",
+    since: 2,
+    properties: &[(
+        "threshold_percent",
+        required(PropKind::Number {
+            max: 100,
+            integer: false,
+            nullable: false,
+        }),
+    )],
+};
+
 /// The onboarding journey's real stages only.
 const ONBOARDING_STAGE: EventRule = EventRule {
     name: "onboarding stage",
@@ -967,8 +981,9 @@ const SESSION_ARCHIVED: EventRule = EventRule {
 
 /// A settled ipython cell that rendered as bash (v2): its executed
 /// `bash()` line share and command count, never command text. One of the
-/// two standalone TUI events (with `agent command used`), tracked per
-/// render by the upstream #3307 addition and kept intact.
+/// standalone TUI events (with `agent command used`),
+/// tracked per render by the upstream #3307
+/// addition and kept intact.
 const TUI_IPYTHON_BASH_RENDERED: EventRule = EventRule {
     name: "tui ipython bash rendered",
     since: 2,
@@ -996,6 +1011,7 @@ const TUI_EXIT: EventRule = EventRule {
         ),
         ("turn_active", required(boolean())),
         ("tui_scroll_count", optional(count())),
+        ("tui_live_tool_timer_count", optional(count())),
         ("tui_selection_count", optional(count())),
         ("tui_click_count", optional(count())),
         ("tui_menu_open_count", optional(count())),
@@ -1219,14 +1235,22 @@ const UPDATE_EVENTS: &[EventRule] = &[
     },
 ];
 
+const HARNESS_REFINEMENTS_CHANGED: EventRule = EventRule {
+    name: "harness refinements changed",
+    since: 2,
+    properties: &[("enabled", required(boolean()))],
+};
+
 /// Every catalogued event, flattened.
 #[must_use]
 pub fn catalog() -> Vec<&'static EventRule> {
     let mut all: Vec<&'static EventRule> = vec![
+        &HARNESS_REFINEMENTS_CHANGED,
         &AGENT_STARTED,
         &AGENT_RUN_COMPLETED,
         &AGENT_SESSION_ENDED,
         &AGENT_COMMAND_USED,
+        &AUTOCOMPACT_THRESHOLD_CHANGED,
         &ONBOARDING_STAGE,
         &ONBOARDING_COMPLETED,
         &AGENT_STARTUP_STAGE,

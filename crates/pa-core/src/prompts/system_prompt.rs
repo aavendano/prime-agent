@@ -73,8 +73,6 @@ pub struct BuildSystemPromptOptions<'a> {
     pub vision_capable: Option<bool>,
     /// Active tools. Tool schemas carry tool descriptions outside the prompt.
     pub selected_tools: Option<Vec<&'a str>>,
-    /// Additional guideline bullets appended to the dynamic tail.
-    pub prompt_guidelines: Option<Vec<String>>,
     pub append_system_prompt: Option<String>,
     pub cwd: String,
     /// Conversation log path.
@@ -88,8 +86,17 @@ pub struct BuildSystemPromptOptions<'a> {
     pub rlm_depth: Option<u32>,
     /// Human-readable parent name or id for child communication doctrine.
     pub rlm_parent_agent: Option<&'a str>,
-    /// Whether the session has no RLM child runtime (no daemon to spawn through).
+    /// Whether this child runs one factory state: the factory reads its
+    /// final message, so the child does not reply to the parent.
+    pub factory_child: bool,
+    /// Whether the session runs without a daemon (no scheduler, no
+    /// heartbeat firing). The wake-up facts the daemonless line states
+    /// must match the embedding's wiring.
     pub daemonless: bool,
+    /// Whether `rlm.spawn` can create children in this session (the
+    /// daemonless print host or a daemon worker); a daemonless session
+    /// without one cannot spawn at all.
+    pub can_spawn: bool,
     /// Enabled user-configured generic MCP servers.
     pub generic_mcp_servers: Vec<String>,
 }
@@ -101,6 +108,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
 }
 
 /// Build the system prompt with its per-layer breakdown.
+#[must_use]
 pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemPromptBreakdown {
     let mut segments: Vec<PromptSegment> = Vec::new();
 
@@ -209,19 +217,6 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
         ));
     }
 
-    let guidelines = options
-        .prompt_guidelines
-        .as_deref()
-        .map(format_prompt_guidelines)
-        .unwrap_or_default();
-    if !guidelines.is_empty() {
-        segments.push(PromptSegment::dynamic_segment(
-            "additional-guidance",
-            "prompt guidelines",
-            format!("# Additional Guidance\n\n{guidelines}"),
-        ));
-    }
-
     if let Some(extra) = options.append_system_prompt.as_deref() {
         if !extra.is_empty() {
             segments.push(PromptSegment::dynamic_segment(
@@ -305,12 +300,24 @@ fn session_role_section(options: &BuildSystemPromptOptions, has_ipython: bool) -
         if depth == 0 { " (root)" } else { " (not root)" }
     )];
     if options.daemonless {
+        lines.push(if options.can_spawn {
+            "This session has no daemon: heartbeats never fire, and background `bash()` completions wake you with a queued `[bash-done]` turn; the run waits for live background commands and your subagents before it exits. Subagent replies and exit notices still wake you."
+                .to_string()
+        } else {
+            "This session has no daemon: `rlm.spawn` is unavailable, heartbeats never fire, and background `bash()` completions wake you with a queued `[bash-done]` turn."
+                .to_string()
+        });
+    }
+    if has_ipython {
         lines.push(
-            "Subagents and completion notifications are unavailable in this session (no daemon): rlm.spawn will error, and nothing wakes you after your turn ends, so await background commands before ending it. Plan to do all work yourself."
+            "`await bash(cmd)` waits at most 1 second. If the command is still running, it returns a snapshot: `r.running` is True, `r.exit_code` is None, `r.output` is the output so far, and `r.handle` is the live handle. A completed result has `r.running` False and an integer `r.exit_code`. The command keeps running after a snapshot; end the turn and collect the final result on the `[bash-done]` notification."
                 .to_string(),
         );
-    }
-    if !has_ipython {
+        lines.push(
+            "Do not run long blocking work in a cell; start long Python work as an asyncio task and check on it in later cells."
+                .to_string(),
+        );
+    } else {
         lines.push(
             "This session has no Python REPL (`python_repl` tool): the programmatic tools described above are unavailable here."
                 .to_string(),
@@ -324,10 +331,16 @@ fn session_role_section(options: &BuildSystemPromptOptions, has_ipython: bool) -
             "You are a child agent spawned by {}. Task prompts are labeled `[task from parent]`.",
             options.rlm_parent_agent.unwrap_or("your parent agent")
         ));
-        if has_ipython {
+        if options.factory_child {
+            lines.push(
+                "Your final message is this state's output, which the factory reads; do not message the parent.".to_string(),
+            );
+        } else if has_ipython {
             lines.push(
                 "When a task calls for an answer, reply explicitly with `await agent_message.send(message, receiver_role=\"parent\")`. Not every message or task needs a reply; continue cleanup after sending and go idle normally.".to_string(),
             );
+        }
+        if has_ipython {
             lines.push(
                 "For long-running work, report brief progress with `await rlm.progress_note('...')` (at most 512 characters, throttled to about one note per 10 seconds); the parent sees notes without needing a reply.".to_string(),
             );
@@ -353,18 +366,6 @@ fn today() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn format_prompt_guidelines(guidelines: &[String]) -> String {
-    let mut seen = std::collections::HashSet::new();
-    let mut list = Vec::new();
-    for guideline in guidelines {
-        let normalized = guideline.trim();
-        if !normalized.is_empty() && seen.insert(normalized.to_string()) {
-            list.push(format!("- {normalized}"));
-        }
-    }
-    list.join("\n")
 }
 
 fn format_generic_mcp_guidance(servers: &[String]) -> String {
@@ -497,6 +498,21 @@ mod tests {
     }
 
     #[test]
+    fn factory_child_gets_the_factory_line_instead_of_the_reply_line() {
+        const REPLY: &str = "reply explicitly with `await agent_message.send(";
+        const FACTORY: &str = "Your final message is this state's output";
+        let mut child = base_options();
+        child.rlm_depth = Some(1);
+        let normal = build_system_prompt(&child);
+        assert!(normal.contains(REPLY));
+        assert!(!normal.contains(FACTORY));
+        child.factory_child = true;
+        let factory = build_system_prompt(&child);
+        assert!(factory.contains(FACTORY));
+        assert!(!factory.contains(REPLY));
+    }
+
+    #[test]
     fn custom_prompt_replaces_layers_keeps_tail() {
         let mut options = base_options();
         options.custom_prompt = Some("Be terse.".to_string());
@@ -514,10 +530,9 @@ mod tests {
     }
 
     #[test]
-    fn mcp_and_guidelines_are_tail_segments() {
+    fn mcp_servers_are_a_tail_segment() {
         let mut options = base_options();
         options.generic_mcp_servers = vec!["t".to_string(), "t".to_string()];
-        options.prompt_guidelines = Some(vec!["be careful".to_string(), "be careful".to_string()]);
         let breakdown = system_prompt_breakdown(&options);
         let names: Vec<&str> = breakdown
             .segments
@@ -525,14 +540,24 @@ mod tests {
             .map(|segment| segment.name)
             .collect();
         assert!(names.contains(&"mcp-servers"));
-        assert!(names.contains(&"additional-guidance"));
         assert!(breakdown.assembled.contains("# Generic MCP Connections"));
         assert!(breakdown
             .assembled
             .contains("Enabled generic MCP servers: `t`."));
-        assert!(breakdown
-            .assembled
-            .contains("# Additional Guidance\n\n- be careful"));
+    }
+
+    #[test]
+    fn daemonless_line_drops_the_stale_no_wake_claim() {
+        // The line's one durable contract: it no longer tells daemonless
+        // agents that background completions never wake them.
+        let mut spawning = base_options();
+        spawning.daemonless = true;
+        spawning.can_spawn = true;
+        assert!(!build_system_prompt(&spawning).contains("completions do not wake you"));
+
+        let mut bare = base_options();
+        bare.daemonless = true;
+        assert!(!build_system_prompt(&bare).contains("completions do not wake you"));
     }
 
     #[test]

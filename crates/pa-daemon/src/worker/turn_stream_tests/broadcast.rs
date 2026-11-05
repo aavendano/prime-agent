@@ -70,6 +70,7 @@ async fn turn_session_events_with_custom_message(
     runner
         .run_turn(
             engine,
+            Lane::Steering,
             vec![QueuedItem {
                 priority: QueuePriority::Background,
                 preview: None,
@@ -157,7 +158,6 @@ async fn a_delivered_agent_message_turn_emits_the_custom_row() {
         recovery_journal_path: dir.join("recovery.jsonl"),
         telemetry_disabled: None,
         script: Some(json!({ "responses": ["ack"] })),
-        decision_child: false,
     };
     let worker = Arc::new(Worker::new(config, None));
     let created = worker
@@ -199,7 +199,7 @@ async fn a_delivered_agent_message_turn_emits_the_custom_row() {
         Arc::new(ScriptedEngine::from_value(&json!({ "responses": ["ack"] })).unwrap_or_default());
     let runner = burst_runner(Arc::clone(&engine));
     let mut subscription = runner.events.subscribe();
-    runner.run_turn(engine, vec![item]).await;
+    runner.run_turn(engine, Lane::Steering, vec![item]).await;
     let mut events = Vec::new();
     while let Ok(frame) = subscription.try_recv() {
         if frame.outbound_type == "session_event" {
@@ -347,7 +347,6 @@ async fn a_retried_turn_broadcasts_one_agent_end_per_run() {
                 { "text": "recovered reply" },
             ],
         })),
-        decision_child: false,
     };
     let worker = std::sync::Arc::new(Worker::new(config, None));
     let created = worker

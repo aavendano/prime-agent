@@ -9,35 +9,6 @@ use super::{
 };
 
 impl AuthStorage {
-    /// Resolve a file-backed credential without blocking the async caller on
-    /// disk locks, environment references, shell commands, or OAuth refresh.
-    /// Empty resolved values are unavailable.
-    ///
-    /// # Errors
-    /// Returns an error if storage cannot be read or parsed, or the blocking
-    /// credential resolver cannot complete.
-    #[tracing::instrument(skip_all)]
-    pub async fn resolve_api_key(
-        agent_dir: &std::path::Path,
-        provider_id: &str,
-    ) -> anyhow::Result<Option<String>> {
-        let agent_dir = agent_dir.to_path_buf();
-        let provider_id = provider_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut auth = Self::create(agent_dir);
-            let key = auth
-                .get_api_key(&provider_id)
-                .filter(|key| !key.trim().is_empty());
-            let errors = auth.drain_errors();
-            if !errors.is_empty() {
-                let detail = errors.join("; ");
-                anyhow::bail!("Could not resolve API credentials: {detail}");
-            }
-            Ok(key)
-        })
-        .await?
-    }
-
     pub fn get_api_key_with_source_token(
         &mut self,
         provider_id: &str,
@@ -175,8 +146,8 @@ impl AuthStorage {
     /// and write). The phases:
     ///
     /// 1. LOAD: the document through the read arm (no document lock).
-    /// 2. FETCH: the token call outside every lock, behind [`refresh_flight`]'s
-    ///    single-flight gate; the expiry is re-checked under the gate so a second
+    /// 2. FETCH: the token call outside the document lock, behind [`refresh_flight`]'s
+    ///    single-flight gate, held through WRITE and reload; expiry is re-checked so a second
     ///    fetch never wastes a single-use refresh token.
     /// 3. WRITE: the locked read-modify-write, holding the lock only for the re-read,
     ///    insert, and atomic write. A peer that refreshed meanwhile keeps its fresher
@@ -210,27 +181,25 @@ impl AuthStorage {
             self.reload();
             return Some(credential);
         }
-        // FETCH: outside every lock, one flight per provider.
-        let fetched = {
-            let _flight = refresh_flight(provider_id);
-            // The gate may have just released a flight that wrote a fresh
-            // credential; re-check before spending a refresh token.
-            let content = self.storage.read().unwrap_or_default();
-            if let Some(credential) = parse_storage_data(content.as_deref())
-                .ok()
-                .and_then(|data| data.credential(provider_id))
-                .filter(|credential| {
-                    matches!(
-                        credential,
-                        AuthCredential::Oauth { expires, .. } if now_epoch_ms() < *expires
-                    )
-                })
-            {
-                self.reload();
-                return Some(credential);
-            }
-            self.oauth.refresh(provider_id, &data)
-        };
+        // FETCH: outside the document lock, one flight through commit and reload.
+        let _flight = refresh_flight(provider_id);
+        // The gate may have just released a flight that wrote a fresh
+        // credential; re-check before spending a refresh token.
+        let content = self.storage.read().unwrap_or_default();
+        if let Some(credential) = parse_storage_data(content.as_deref())
+            .ok()
+            .and_then(|data| data.credential(provider_id))
+            .filter(|credential| {
+                matches!(
+                    credential,
+                    AuthCredential::Oauth { expires, .. } if now_epoch_ms() < *expires
+                )
+            })
+        {
+            self.reload();
+            return Some(credential);
+        }
+        let fetched = self.oauth.refresh(provider_id, &data);
         let Some(new_credential) = fetched else {
             // Refresh failed: keep credentials for a later retry; a peer
             // may have refreshed meanwhile, so reload before failing.

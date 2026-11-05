@@ -24,6 +24,8 @@ use launch_budget::WORKER_AUTH_FLOOR_MS;
 use signals_shutdown::daemon_closing_shutdown_event;
 mod supervision;
 
+#[cfg(all(test, unix))]
+mod dead_child_delete_tests;
 #[cfg(test)]
 mod handshake_tests;
 #[cfg(test)]
@@ -55,6 +57,7 @@ pub(crate) use routing::{
 };
 
 // Called only by the supervision sibling module and in-file tests; lib-target unused.
+pub(crate) use worker_lifecycle::RosterFamilySeedOwner;
 #[allow(unused_imports)]
 use worker_lifecycle::{probe_worker_socket, worker_connect_deadline};
 
@@ -220,15 +223,15 @@ pub struct Supervisor {
     /// when the worker could not answer; feeds the replacement-worker create replay,
     /// cleared by a landed `compaction_end`.
     pub(crate) compaction_journal:
-        std::sync::Mutex<crate::compaction_supervision::TerminalCompactionJournal>,
+        std::sync::Mutex<Option<crate::compaction_supervision::TerminalCompactionJournal>>,
 }
 
 impl Supervisor {
-    /// Build the supervisor: descriptor dir, persisted config, event channel, log, journal.
+    /// Build the supervisor: descriptor dir, persisted config, event channel, and log.
     ///
     /// # Errors
     ///
-    /// Returns an error when the descriptor dir, sessions dir, config, or journal cannot be opened.
+    /// Returns an error when the descriptor dir, sessions dir, or config cannot be opened.
     pub fn new(options: SupervisorOptions) -> Result<Self> {
         let descriptor_dir =
             crate::descriptor::descriptor_dir(&options.agent_dir, &options.socket_path);
@@ -250,9 +253,6 @@ impl Supervisor {
             &options.socket_path,
             &options.agent_dir,
         ));
-        let compaction_journal = crate::compaction_supervision::TerminalCompactionJournal::open(
-            &descriptor_dir.join("compaction-supervision.jsonl"),
-        )?;
         Ok(Supervisor {
             options,
             descriptor_dir,
@@ -286,7 +286,7 @@ impl Supervisor {
             passive_scan_gate: tokio::sync::Mutex::new(()),
             passive_scan_pending: std::sync::atomic::AtomicBool::new(false),
             passive_catalog_epoch: std::sync::atomic::AtomicU64::new(0),
-            compaction_journal: std::sync::Mutex::new(compaction_journal),
+            compaction_journal: std::sync::Mutex::new(None),
         })
     }
 
@@ -295,7 +295,8 @@ impl Supervisor {
     /// # Errors
     ///
     /// Returns an error when the socket path cannot be prepared (already in use), the
-    /// socket cannot be bound, or the accept loop exhausts its give-up budget.
+    /// socket cannot be bound, the recovery journal cannot be opened, or the accept loop
+    /// exhausts its give-up budget.
     ///
     /// # Panics
     ///
@@ -345,6 +346,16 @@ impl Supervisor {
                 supervisor.note_catalog_refresh(count);
             });
         }
+        // The first open's family walk reads the spawn ledger: replay it
+        // while that open's worker launches, not on its reply path.
+        {
+            let supervisor = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Ok(ledger) = supervisor.rlm_spawn_ledger_for(None).await {
+                    drop(tokio::task::spawn_blocking(move || ledger.warm()).await);
+                }
+            });
+        }
         socket::prepare_socket_path(&self.options.socket_path).await?;
         let listener = bind_transport(&self.options.socket_path)
             .await
@@ -363,6 +374,22 @@ impl Supervisor {
         *self.bound_socket_identity.lock().unwrap() =
             socket::socket_identity(&self.options.socket_path);
         socket::restrict_socket_path(&self.options.socket_path);
+        match crate::compaction_supervision::TerminalCompactionJournal::open(
+            &self.descriptor_dir.join("compaction-supervision.jsonl"),
+        ) {
+            Ok(journal) => {
+                *self
+                    .compaction_journal
+                    .lock()
+                    .expect("compaction journal lock") = Some(journal);
+            }
+            Err(error) => {
+                drop(listener);
+                let identity = self.bound_socket_identity.lock().unwrap().clone();
+                socket::cleanup_socket_path_after_close(&self.options.socket_path, identity);
+                return Err(error);
+            }
+        }
         self.log
             .append(&format!("supervisor started pid {}", std::process::id()));
         match open_file_limit {
@@ -448,16 +475,6 @@ impl Supervisor {
             tokio::spawn(async move {
                 Supervisor::wait_for_adoption_signal(&mut adopted).await;
                 supervisor.spawn_passive_catalog_warmup();
-            });
-        }
-
-        // Session-archive sweep (roadmap: the sessions directory must not
-        // grow forever): boot sweep, then the periodic re-sweep at the TS
-        // idle-eviction cadence. Housekeeping only — it never gates serving.
-        {
-            let supervisor = Arc::clone(&self);
-            tokio::spawn(async move {
-                crate::session_archive::archive_sweep_loop(&supervisor).await;
             });
         }
 

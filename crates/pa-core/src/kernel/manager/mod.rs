@@ -27,12 +27,12 @@ use crate::kernel::shared::{
     KernelShutdownOptions, LateSentAgentMessageCallback, StreamName, AGENT_MESSAGE_DISPLAY_MIME,
     ATTACHMENT_DISPLAY_MIME, BASH_ACTIVITY_DISPLAY_MIME, BASH_COMMAND_DISPLAY_MIME,
     DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_SNAPSHOT_DEBOUNCE_MS, DIFF_DISPLAY_MIME,
-    FACTIVITY_SETTLE_TIMEOUT_MS, FACTIVITY_WATCH_TIMEOUT_MS_CAP, HOST_REQUEST_SHUTDOWN_TIMEOUT_MS,
-    KERNEL_ABORT_GRACE_MS, KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE, KERNEL_BUSY_INTERRUPT_INTERVAL_MS,
-    KERNEL_BUSY_REUSE_WAIT_MS, KERNEL_SHUTDOWN_TIMEOUT_MS, KERNEL_STDERR_LOG_BUDGET_MARKER,
-    MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS, MAX_KERNEL_STDERR_CHARS,
-    MAX_KERNEL_STDERR_LOG_BYTES, MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS,
-    RESTORE_EXECUTION_TIMEOUT_MS, SNAPSHOT_EXECUTION_TIMEOUT_MS,
+    END_TURN_REQUEST_TYPE, FACTIVITY_SETTLE_TIMEOUT_MS, FACTIVITY_WATCH_TIMEOUT_MS_CAP,
+    HOST_REQUEST_SHUTDOWN_TIMEOUT_MS, KERNEL_ABORT_GRACE_MS, KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE,
+    KERNEL_BUSY_INTERRUPT_INTERVAL_MS, KERNEL_BUSY_REUSE_WAIT_MS, KERNEL_SHUTDOWN_TIMEOUT_MS,
+    KERNEL_STDERR_LOG_BUDGET_MARKER, MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS,
+    MAX_KERNEL_STDERR_CHARS, MAX_KERNEL_STDERR_LOG_BYTES, MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS,
+    RESTORE_EXECUTION_TIMEOUT_MS, SNAPSHOT_EXECUTION_TIMEOUT_MS, TRANSCRIPT_READ_DISPLAY_MIME,
 };
 use crate::kernel::state_snapshot::{
     RestoreResult, SnapshotResult, SnapshotSkip, DEFAULT_SNAPSHOT_MAX_BYTES,
@@ -82,34 +82,33 @@ struct ExitInfo {
 }
 
 /// Fields of a settled execution shared with the stdout reader task.
+#[allow(clippy::struct_excessive_bools)] // independent settlement flags, not a state machine
 #[derive(Default)]
-// The mirrored TS API shape is deliberate (the booleans are the product's own surface).
-#[allow(clippy::struct_excessive_bools)]
 struct ExecBuffers {
-    stdout: String,
-    stderr: String,
-    stdout_chars: usize,
-    stderr_chars: usize,
-    stdout_truncated: bool,
-    stderr_truncated: bool,
+    stdout: HeadTailBuffer,
+    stderr: HeadTailBuffer,
     result: Option<String>,
     diffs: Vec<KernelDiffDisplay>,
     attachments: Vec<KernelAttachment>,
     attachment_oversized: bool,
     sent_agent_messages: Vec<KernelSentAgentMessage>,
     bash_commands: Option<KernelBashCommands>,
+    transcript_reads: Vec<Value>,
     background_output: String,
     background_output_chars: usize,
     background_output_truncated: bool,
     error: Option<KernelError>,
     status: ExecuteStatus,
+    /// The cell called `rlm.end_turn()`; the host-request dispatch marks it.
+    ended_turn: bool,
     done_fields: Option<Value>,
     settled: bool,
+    /// The time limit the cell outlived and was interrupted for.
+    timed_out_after_ms: Option<u64>,
 }
 
 pub(crate) struct ActiveExecution {
     request_id: String,
-    code: String,
     started: Instant,
     max_chars: usize,
     opts: ExecuteOptions,
@@ -139,10 +138,13 @@ impl InternalExecuteResult {
                 attachments: None,
                 sent_agent_messages: None,
                 bash_commands: None,
+                transcript_reads: None,
                 background_output: None,
+                ended_turn: false,
                 status: ExecuteStatus::Aborted,
                 error: None,
                 duration_ms: started.elapsed().as_millis() as u64,
+                timed_out_after_ms: None,
             },
             done_fields: None,
         }
@@ -323,9 +325,6 @@ struct Guarded {
     mcp_status_waiters: HashMap<String, oneshot::Sender<Value>>,
     host_inflight: Vec<tokio::task::JoinHandle<()>>,
     active_execution: Option<Arc<ActiveExecution>>,
-    /// Source of the most recently started cell, retained after it finishes so
-    /// rlm.run spawns from detached asyncio tasks can still attribute their spawning program.
-    last_cell_code: Option<String>,
     ready_tx: Option<oneshot::Sender<anyhow::Result<i64>>>,
 }
 
@@ -419,7 +418,7 @@ mod snapshot;
 mod startup;
 mod teardown;
 
-use requests::{append_truncated, describe_failure, Signal};
+use requests::{append_truncated, describe_failure, HeadTailBuffer, Signal};
 
 // Public API
 
@@ -462,7 +461,6 @@ impl ReplKernelManager {
                 mcp_status_waiters: HashMap::new(),
                 host_inflight: Vec::new(),
                 active_execution: None,
-                last_cell_code: None,
                 ready_tx: None,
             }),
             child: Mutex::new(None),
@@ -611,6 +609,8 @@ impl ReplKernelManager {
         let result = self
             .enqueue_execute(code, opts, execution_timeout_ms)
             .await?;
+        // An ok cell committed its namespace changes: refresh the snapshot,
+        // or a crash would revive a namespace missing the cell.
         if result.result.status == ExecuteStatus::Ok {
             self.schedule_snapshot();
         }
@@ -628,7 +628,6 @@ impl ReplKernelManager {
             Request::Execute {
                 code: code.to_string(),
             },
-            code,
             opts,
             execution_timeout_ms,
         )
@@ -817,10 +816,7 @@ impl ReplKernelManager {
             signal,
             ..ExecuteOptions::default()
         };
-        match self
-            .enqueue_request(Request::ListNames, "", opts, None)
-            .await
-        {
+        match self.enqueue_request(Request::ListNames, opts, None).await {
             Ok(r) if r.result.status == ExecuteStatus::Ok => {
                 let names = r
                     .done_fields
